@@ -15,6 +15,8 @@ struct Uniforms {
   float2 cell_size;
   ushort2 grid_size;
   float4 grid_padding;
+  float2 grid_translate;
+  float2 grid_clip;
   uint8_t padding_extend;
   float min_contrast;
   ushort2 cursor_pos;
@@ -453,7 +455,8 @@ fragment float4 cell_bg_fragment(
   constant Uniforms& uniforms [[buffer(1)]],
   constant uchar4 *cells [[buffer(2)]]
 ) {
-  int2 grid_pos = int2(floor((in.position.xy - uniforms.grid_padding.wx) / uniforms.cell_size));
+  // Subtract the grid translate to map fragment coords to buffer space.
+  int2 grid_pos = int2(floor((in.position.xy - uniforms.grid_padding.wx - uniforms.grid_translate) / uniforms.cell_size));
 
   float4 bg = float4(0.0);
 
@@ -551,6 +554,7 @@ struct CellTextVertexOut {
   float4 color [[flat]];
   float4 bg_color [[flat]];
   float2 tex_coord;
+  float grid_y;
 };
 
 vertex CellTextVertexOut cell_text_vertex(
@@ -559,8 +563,9 @@ vertex CellTextVertexOut cell_text_vertex(
   constant Uniforms& uniforms [[buffer(1)]],
   constant uchar4 *bg_colors [[buffer(2)]]
 ) {
-  // Convert the grid x, y into world space x, y by accounting for cell size
-  float2 cell_pos = uniforms.cell_size * float2(in.grid_pos);
+  // Convert the grid x, y into world space x, y by accounting for cell
+  // size. The grid translate shifts the buffer by a fractional row.
+  float2 cell_pos = uniforms.cell_size * float2(in.grid_pos) + uniforms.grid_translate;
 
   // We use a triangle strip with 4 vertices to render quads,
   // so we determine which corner of the cell this vertex is in
@@ -619,6 +624,9 @@ vertex CellTextVertexOut cell_text_vertex(
   cell_pos = cell_pos + size * corner + offset;
   out.position =
       uniforms.projection_matrix * float4(cell_pos.x, cell_pos.y, 0.0f, 1.0f);
+
+  // The fragment shader clips contents moved outside the viewport.
+  out.grid_y = cell_pos.y;
 
   // Calculate the texture coordinate in pixels. This is NOT normalized
   // (between 0.0 and 1.0), and does not need to be, since the texture will
@@ -681,6 +689,11 @@ fragment float4 cell_text_fragment(
   texture2d<float> textureColor [[texture(1)]],
   constant Uniforms& uniforms [[buffer(1)]]
 ) {
+  // Discard fragments the grid translate moved outside the viewport.
+  if (in.grid_y < uniforms.grid_clip.x || in.grid_y > uniforms.grid_clip.y) {
+    discard_fragment();
+  }
+
   constexpr sampler textureSampler(
     coord::pixel,
     address::clamp_to_edge,
@@ -783,6 +796,7 @@ struct ImageVertexIn {
 struct ImageVertexOut {
   float4 position [[position]];
   float2 tex_coord;
+  float grid_y;
 };
 
 vertex ImageVertexOut image_vertex(
@@ -820,12 +834,15 @@ vertex ImageVertexOut image_vertex(
 
   // The position of our image starts at the top-left of the grid cell and
   // adds the source rect width/height components.
-  float2 image_pos = (uniforms.cell_size * in.grid_pos) + in.cell_offset;
+  float2 image_pos = (uniforms.cell_size * in.grid_pos) + in.cell_offset + uniforms.grid_translate;
   image_pos += in.dest_size * corner;
 
   out.position =
       uniforms.projection_matrix * float4(image_pos.x, image_pos.y, 0.0f, 1.0f);
   out.tex_coord = tex_coord;
+
+  // The fragment shader clips contents moved outside the viewport.
+  out.grid_y = image_pos.y;
   return out;
 }
 
@@ -834,6 +851,11 @@ fragment float4 image_fragment(
   texture2d<float> image [[texture(0)]],
   constant Uniforms& uniforms [[buffer(1)]]
 ) {
+  // Discard fragments the grid translate moved outside the viewport.
+  if (in.grid_y < uniforms.grid_clip.x || in.grid_y > uniforms.grid_clip.y) {
+    discard_fragment();
+  }
+
   constexpr sampler textureSampler(
     coord::pixel,
     address::clamp_to_edge,

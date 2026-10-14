@@ -34,6 +34,7 @@ out CellTextVertexOut {
     flat vec4 color;
     flat vec4 bg_color;
     vec2 tex_coord;
+    float grid_y;
 } out_data;
 
 layout(binding = 1, std430) readonly buffer bg_cells {
@@ -46,8 +47,9 @@ void main() {
     bool cursor_wide = (bools & CURSOR_WIDE) != 0;
     bool use_linear_blending = (bools & USE_LINEAR_BLENDING) != 0;
 
-    // Convert the grid x, y into world space x, y by accounting for cell size
-    vec2 cell_pos = cell_size * vec2(grid_pos);
+    // Convert the grid x, y into world space x, y by accounting for cell size.
+    // The grid translate shifts the buffer by a fractional row.
+    vec2 cell_pos = cell_size * vec2(grid_pos) + grid_translate;
 
     int vid = gl_VertexID;
 
@@ -106,6 +108,9 @@ void main() {
     // and glyph offset to create the correct bounding box for the glyph.
     cell_pos = cell_pos + size * corner + offset;
     gl_Position = projection_matrix * vec4(cell_pos.x, cell_pos.y, 0.0f, 1.0f);
+
+    // The fragment shader clips contents moved outside the viewport.
+    out_data.grid_y = cell_pos.y;
 
     // Calculate the texture coordinate in pixels. This is NOT normalized
     // (between 0.0 and 1.0), and does not need to be, since the texture will

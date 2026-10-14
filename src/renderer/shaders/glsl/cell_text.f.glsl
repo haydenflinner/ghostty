@@ -8,6 +8,7 @@ in CellTextVertexOut {
     flat vec4 color;
     flat vec4 bg_color;
     vec2 tex_coord;
+    float grid_y;
 } in_data;
 
 // Values `atlas` can take.
@@ -18,6 +19,11 @@ const uint ATLAS_COLOR = 1u;
 layout(location = 0) out vec4 out_FragColor;
 
 void main() {
+    // Discard fragments the grid translate moved outside the viewport.
+    if (in_data.grid_y < grid_clip.x || in_data.grid_y > grid_clip.y) {
+        discard;
+    }
+
     bool use_linear_blending = (bools & USE_LINEAR_BLENDING) != 0;
     bool use_linear_correction = (bools & USE_LINEAR_CORRECTION) != 0;
 
