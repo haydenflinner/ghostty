@@ -42,9 +42,21 @@ pub const Key = enum {
 pub const Contents = struct {
     size: renderer.GridSize = .{ .rows = 0, .columns = 0 },
 
+    /// The number of additional buffer rows reserved above and below the
+    /// logical grid, used to render rows that are partially outside the
+    /// viewport during fractional (smooth) scrolling.
+    ///
+    /// Buffer rows are indexed so that logical grid row `y` lives at
+    /// buffer row `y + overscan_above`: the first `overscan_above` rows
+    /// hold rows above the viewport and the last `overscan_below` hold
+    /// rows below it. All row-indexed methods take buffer rows.
+    overscan_above: usize = 0,
+    overscan_below: usize = 0,
+
     /// Flat array containing cell background colors for the terminal grid.
     ///
-    /// Indexed as `bg_cells[row * size.columns + col]`.
+    /// Indexed as `bg_cells[row * size.columns + col]` where `row` is a
+    /// buffer row (logical grid row + `overscan_above`).
     ///
     /// Prefer accessing with `Contents.bgCell(row, col).*` instead
     /// of directly indexing in order to avoid integer size bugs.
@@ -79,14 +91,23 @@ pub const Contents = struct {
         alloc.free(self.fg_rows);
     }
 
+    /// The number of buffer rows: the logical grid rows plus any
+    /// overscan rows reserved above and below it.
+    pub fn bufferRows(self: *const Contents) usize {
+        return self.size.rows + self.overscan_above + self.overscan_below;
+    }
+
     /// Resize the cell contents for the given grid size. This will
     /// always invalidate the entire cell contents.
+    ///
+    /// The buffer is sized for `size` plus the `overscan_above` and
+    /// `overscan_below` fields, which callers set before resizing.
     pub fn resize(
         self: *Contents,
         alloc: Allocator,
         size: renderer.GridSize,
     ) Allocator.Error!void {
-        const row_count: usize = size.rows;
+        const row_count: usize = size.rows + self.overscan_above + self.overscan_below;
 
         // The two extra lists hold cursor cells: index 0 is drawn before the
         // row contents, and index row_count + 1 is drawn after them.
@@ -140,7 +161,7 @@ pub const Contents = struct {
     ) void {
         if (self.size.rows == 0) return;
         self.fg_rows[0].clearRetainingCapacity();
-        self.fg_rows[self.size.rows + 1].clearRetainingCapacity();
+        self.fg_rows[self.fg_rows.len - 1].clearRetainingCapacity();
 
         const cell = v orelse return;
         const style = cursor_style orelse return;
@@ -149,7 +170,7 @@ pub const Contents = struct {
             // Block cursors should be drawn first
             .block => self.fg_rows[0].appendAssumeCapacity(cell),
             // Other cursor styles should be drawn last
-            .block_hollow, .bar, .underline, .lock => self.fg_rows[self.size.rows + 1].appendAssumeCapacity(cell),
+            .block_hollow, .bar, .underline, .lock => self.fg_rows[self.fg_rows.len - 1].appendAssumeCapacity(cell),
         }
     }
 
@@ -159,8 +180,8 @@ pub const Contents = struct {
         if (self.fg_rows[0].items.len > 0) {
             return self.fg_rows[0].items[0];
         }
-        if (self.fg_rows[self.size.rows + 1].items.len > 0) {
-            return self.fg_rows[self.size.rows + 1].items[0];
+        if (self.fg_rows[self.fg_rows.len - 1].items.len > 0) {
+            return self.fg_rows[self.fg_rows.len - 1].items[0];
         }
         return null;
     }
@@ -178,6 +199,9 @@ pub const Contents = struct {
     /// Add a cell to the appropriate list. Adding the same cell twice will
     /// result in duplication in the vertex buffer. The caller should clear
     /// the corresponding row with Contents.clear to remove old cells first.
+    ///
+    /// `cell.grid_pos[1]` is a buffer row, so logical grid row `y` is
+    /// `y + overscan_above`.
     pub fn add(
         self: *Contents,
         alloc: Allocator,
@@ -186,7 +210,7 @@ pub const Contents = struct {
     ) Allocator.Error!void {
         const y = cell.grid_pos[1];
 
-        assert(y < self.size.rows);
+        assert(y < self.bufferRows());
 
         switch (key) {
             .bg => comptime unreachable,
@@ -202,9 +226,9 @@ pub const Contents = struct {
         }
     }
 
-    /// Clear all of the cell contents for a given row.
+    /// Clear all of the cell contents for a given buffer row.
     pub fn clear(self: *Contents, y: terminal.size.CellCountInt) void {
-        assert(y < self.size.rows);
+        assert(y < self.bufferRows());
 
         @memset(self.bg_cells[@as(usize, y) * self.size.columns ..][0..self.size.columns], .{ 0, 0, 0, 0 });
 
