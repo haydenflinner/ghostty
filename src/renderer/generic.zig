@@ -179,6 +179,12 @@ pub fn Renderer(comptime GraphicsAPI: type) type {
         /// cells for the draw call.
         cells_rebuilt: bool = false,
 
+        /// Set to true when the fractional scroll offset (grid
+        /// translation) changed since the last draw. This forces a
+        /// redraw even when no cell contents changed, which is the
+        /// common case while smooth scrolling.
+        scroll_offset_changed: bool = false,
+
         /// The current GPU uniform values.
         uniforms: shaderpkg.Uniforms,
 
@@ -757,6 +763,8 @@ pub fn Renderer(comptime GraphicsAPI: type) type {
                     .cell_size = undefined,
                     .grid_size = undefined,
                     .grid_padding = undefined,
+                    .grid_translate = undefined,
+                    .grid_clip = undefined,
                     .screen_size = undefined,
                     .padding_extend = .{},
                     .min_contrast = options.config.min_contrast,
@@ -822,6 +830,14 @@ pub fn Renderer(comptime GraphicsAPI: type) type {
                 // Shaders are initialized lazily on the render thread.
                 .shaders = .uninit,
             };
+
+            // We always capture one row of overscan above and below the
+            // viewport so that a fractional scroll offset can render
+            // partial rows at the edges (smooth scrolling). The cell
+            // buffer is sized to match so buffer rows index row_data 1:1.
+            result.terminal_state.overscan_request = .{ .above = 1, .below = 1 };
+            result.cells.overscan_above = 1;
+            result.cells.overscan_below = 1;
 
             // Ensure our undefined values above are correctly initialized.
             result.updateFontGridUniforms();
@@ -1379,6 +1395,7 @@ pub fn Renderer(comptime GraphicsAPI: type) type {
             if (self.terminal_state_frame_count >= max_terminal_state_frame_count) {
                 self.terminal_state.deinit(self.alloc);
                 self.terminal_state = .empty;
+                self.terminal_state.overscan_request = .{ .above = 1, .below = 1 };
                 self.terminal_state_frame_count = 0;
             }
             self.terminal_state_frame_count += 1;
@@ -1434,8 +1451,10 @@ pub fn Renderer(comptime GraphicsAPI: type) type {
                     self.last_bottom_node = @intFromPtr(br.node);
                     self.last_bottom_y = br.y;
 
-                    // Scroll
+                    // Scroll. This moves the viewport outside of scroll
+                    // events so the fractional offset must not carry.
                     state.terminal.scrollViewport(.bottom);
+                    state.scroll_offset_px = 0;
                 }
 
                 // Begin the update of our terminal state. Work that
@@ -1447,6 +1466,65 @@ pub fn Renderer(comptime GraphicsAPI: type) type {
                     self.alloc,
                     state.terminal,
                 );
+
+                // Update our fractional scroll offset. The offset is
+                // rendered by translating the whole grid vertically; we
+                // only honor it when an overscan row exists in the given
+                // direction to reveal, otherwise we snap to the row
+                // boundary. (The surface also clamps it, but terminal
+                // state can move out from under a stale offset, e.g.
+                // when scrollback is pruned.)
+                {
+                    const cell_height: f32 = @floatFromInt(self.grid_metrics.cell_height);
+                    const offset: f32 = offset: {
+                        // The offset should always be less than a cell
+                        // but it can go stale when the cell size changes,
+                        // so clamp it defensively.
+                        const o = std.math.clamp(
+                            state.scroll_offset_px,
+                            1 - cell_height,
+                            cell_height - 1,
+                        );
+                        if (o > 0 and self.terminal_state.overscan.above > 0)
+                            break :offset o;
+                        if (o < 0 and self.terminal_state.overscan.below > 0)
+                            break :offset o;
+                        break :offset 0;
+                    };
+
+                    // Buffer rows index row_data directly, so the
+                    // viewport starts at `viewportStart` buffer rows in.
+                    // The translate maps buffer rows to screen rows plus
+                    // the fractional offset.
+                    const translate: f32 = offset - cell_height * @as(
+                        f32,
+                        @floatFromInt(self.terminal_state.viewportStart()),
+                    );
+                    if (self.uniforms.grid_translate[1] != translate) {
+                        self.uniforms.grid_translate = .{ 0, translate };
+                        self.scroll_offset_changed = true;
+                    }
+
+                    // Grid contents are only visible within the viewport
+                    // area; overscan rows and translated rows outside it
+                    // are clipped by the shader.
+                    const clip: f32 = cell_height * @as(
+                        f32,
+                        @floatFromInt(self.terminal_state.rows),
+                    );
+                    self.uniforms.grid_clip = .{ 0, clip };
+
+                    // Images use viewport-relative positions; give them
+                    // the same overscan bias so they translate with the
+                    // rest of the grid.
+                    self.images.overscan_above = @intCast(
+                        self.terminal_state.viewportStart(),
+                    );
+                    self.images.overscan_below = @intCast(
+                        self.terminal_state.overscan_request.below,
+                    );
+                    self.images.scroll_translate_px = translate;
+                }
 
                 // If our terminal state is dirty at all we need to redo
                 // the viewport search.
@@ -1786,6 +1864,7 @@ pub fn Renderer(comptime GraphicsAPI: type) type {
                 size_changed or
                 swap_chain_rebuilt or
                 self.cells_rebuilt or
+                self.scroll_offset_changed or
                 self.animationWake() != null or
                 sync;
 
@@ -1796,6 +1875,7 @@ pub fn Renderer(comptime GraphicsAPI: type) type {
                 return true;
             }
             self.cells_rebuilt = false;
+            self.scroll_offset_changed = false;
 
             // Wait for a frame to be available.
             const frame = swap_chain.nextFrame();
@@ -2633,11 +2713,15 @@ pub fn Renderer(comptime GraphicsAPI: type) type {
                 new_size.rows = state.rows;
                 new_size.columns = state.cols;
                 try self.cells.resize(self.alloc, new_size);
-
-                // Update our uniforms accordingly, otherwise
-                // our background cells will be out of place.
-                self.uniforms.grid_size = .{ new_size.columns, new_size.rows };
             }
+
+            // Update our grid size uniform. This is the size of our cell
+            // buffer, which includes any overscan rows surrounding the
+            // viewport, not the size of the viewport itself.
+            self.uniforms.grid_size = .{
+                @intCast(self.cells.size.columns),
+                @intCast(self.cells.bufferRows()),
+            };
 
             const rebuild = state.dirty == .full or grid_size_diff;
             if (rebuild) {
@@ -2673,13 +2757,19 @@ pub fn Renderer(comptime GraphicsAPI: type) type {
             const row_selection = row_data.items(.selection);
             const row_highlights = row_data.items(.highlights);
 
+            // The viewport starts after the requested overscan rows.
+            // Buffer rows index row_data directly so that row `i` is
+            // drawn at viewport y `i - viewport_start`.
+            const viewport_start: usize = state.viewportStart();
+
             // If our cell contents buffer is shorter than the screen viewport,
             // we render the rows that fit, starting from the bottom. If instead
             // the viewport is shorter than the cell contents buffer, we align
             // the top of the viewport with the top of the contents buffer.
-            const row_len: usize = @min(
-                state.rows,
-                self.cells.size.rows,
+            const row_range = state.rowDataRange();
+            const row_end: usize = @min(
+                row_range.end,
+                self.cells.bufferRows(),
             );
 
             // Determine our x/y range for preedit. We don't want to render anything
@@ -2694,7 +2784,7 @@ pub fn Renderer(comptime GraphicsAPI: type) type {
                 // If our preedit row isn't dirty then we don't need the
                 // preedit range. This also avoids an issue later where we
                 // unconditionally add preedit cells when this is set.
-                if (!rebuild and !row_dirty[cursor_vp.y]) break :preedit null;
+                if (!rebuild and !row_dirty[cursor_vp.y + viewport_start]) break :preedit null;
 
                 const range = preedit_v.range(
                     cursor_vp.x,
@@ -2708,12 +2798,12 @@ pub fn Renderer(comptime GraphicsAPI: type) type {
             } else null;
 
             for (
-                0..,
-                row_raws[0..row_len],
-                row_cells[0..row_len],
-                row_dirty[0..row_len],
-                row_selection[0..row_len],
-                row_highlights[0..row_len],
+                row_range.start..row_end,
+                row_raws[row_range.start..row_end],
+                row_cells[row_range.start..row_end],
+                row_dirty[row_range.start..row_end],
+                row_selection[row_range.start..row_end],
+                row_highlights[row_range.start..row_end],
             ) |y_usize, row, *cells, *dirty, selection, *highlights| {
                 const y: terminal.size.CellCountInt = @intCast(y_usize);
 
@@ -2746,6 +2836,27 @@ pub fn Renderer(comptime GraphicsAPI: type) type {
                 };
             }
 
+            // When an overscan row wasn't captured by the render state
+            // (nothing exists beyond the viewport), mirror the nearest
+            // viewport row's background into its buffer row so that the
+            // padding extension in the background shader behaves the
+            // same as it did without overscan. These rows are never
+            // visible: a fractional offset is only honored when a row
+            // exists to reveal, and the clip bounds exclude them.
+            if (self.cells.size.columns > 0 and self.cells.bufferRows() > 2) {
+                const cols: usize = self.cells.size.columns;
+                if (state.overscan.above == 0)
+                    @memcpy(
+                        self.cells.bg_cells[0..cols],
+                        self.cells.bg_cells[cols..][0..cols],
+                    );
+                if (state.overscan.below == 0)
+                    @memcpy(
+                        self.cells.bg_cells[(self.cells.bufferRows() - 1) * cols ..][0..cols],
+                        self.cells.bg_cells[(self.cells.bufferRows() - 2) * cols ..][0..cols],
+                    );
+            }
+
             // Setup our cursor rendering information.
             cursor: {
                 // Clear our cursor by default.
@@ -2761,7 +2872,7 @@ pub fn Renderer(comptime GraphicsAPI: type) type {
                 const cursor_vp = state.cursor.viewport orelse break :cursor;
                 const cursor_style: terminal.Style = cursor_style: {
                     const cells = state.row_data.items(.cells);
-                    const cell = cells[cursor_vp.y].get(cursor_vp.x);
+                    const cell = cells[cursor_vp.y + viewport_start].get(cursor_vp.x);
                     break :cursor_style if (cell.raw.hasStyling())
                         cell.style
                     else
@@ -2832,7 +2943,7 @@ pub fn Renderer(comptime GraphicsAPI: type) type {
                             .narrow, .spacer_head, .wide => cursor_vp.x,
                             .spacer_tail => cursor_vp.x -| 1,
                         },
-                        @intCast(cursor_vp.y),
+                        @intCast(cursor_vp.y + viewport_start),
                     };
 
                     self.uniforms.bools.cursor_wide = switch (wide) {
@@ -2888,7 +2999,10 @@ pub fn Renderer(comptime GraphicsAPI: type) type {
                 for (preedit_v.codepoints[range.cp_offset..]) |cp| {
                     self.addPreeditCell(
                         cp,
-                        .{ .x = x, .y = range.y },
+                        .{ .x = x, .y = range.y +| @as(
+                            terminal.size.CellCountInt,
+                            @intCast(viewport_start),
+                        ) },
                         state.colors.foreground,
                     ) catch |err| {
                         log.warn("error building preedit cell, will be invalid x={} y={}, err={}", .{
@@ -2911,6 +3025,10 @@ pub fn Renderer(comptime GraphicsAPI: type) type {
             // });
         }
 
+        /// Rebuild the row at the given buffer row. A buffer row indexes
+        /// the render state's `row_data` directly; `viewportY` converts
+        /// it to a viewport-relative y, which is negative for overscan
+        /// rows above the viewport and `rows` or greater below it.
         fn rebuildRow(
             self: *Self,
             y: terminal.size.CellCountInt,
@@ -2922,6 +3040,7 @@ pub fn Renderer(comptime GraphicsAPI: type) type {
             links: *const terminal.RenderState.CellSet,
         ) !void {
             const state = &self.terminal_state;
+            const vy: isize = state.viewportY(y);
 
             // If our viewport is wider than our cell contents buffer,
             // we still only process cells up to the width of the buffer.
@@ -2940,7 +3059,7 @@ pub fn Renderer(comptime GraphicsAPI: type) type {
                 .background, .@"extend-always" => {},
 
                 // Apply heuristics for padding extension.
-                .extend => if (y == 0) {
+                .extend => if (vy == 0) {
                     self.uniforms.padding_extend.up = !rowNeverExtendBg(
                         row,
                         cells_raw,
@@ -2948,7 +3067,7 @@ pub fn Renderer(comptime GraphicsAPI: type) type {
                         &state.colors.palette,
                         state.colors.background,
                     );
-                } else if (y == self.cells.size.rows - 1) {
+                } else if (vy == @as(isize, state.rows) - 1) {
                     self.uniforms.padding_extend.down = !rowNeverExtendBg(
                         row,
                         cells_raw,
@@ -2969,7 +3088,7 @@ pub fn Renderer(comptime GraphicsAPI: type) type {
                 // visible on this viewport.
                 .cursor_x = cursor_x: {
                     const vp = state.cursor.viewport orelse break :cursor_x null;
-                    if (vp.y != y) break :cursor_x null;
+                    if (vp.y != vy) break :cursor_x null;
                     break :cursor_x vp.x;
                 },
             };
@@ -2988,7 +3107,7 @@ pub fn Renderer(comptime GraphicsAPI: type) type {
                 // skip this because preedits are setup separately.
                 if (preedit_range) |range| preedit: {
                     // We're not on the preedit line, no actions necessary.
-                    if (range.y != y) break :preedit;
+                    if (range.y != vy) break :preedit;
                     // We're before the preedit range, no actions necessary.
                     if (x < range.x[0]) break :preedit;
                     // We're in the preedit range, skip this cell.
@@ -3233,11 +3352,12 @@ pub fn Renderer(comptime GraphicsAPI: type) type {
 
                 // Give links a single underline, unless they already have
                 // an underline, in which case use a double underline to
-                // distinguish them.
+                // distinguish them. Links are keyed by viewport y, which
+                // is negative for overscan rows above the viewport.
                 const underline: terminal.Attribute.Underline = underline: {
-                    if (links.contains(.{
+                    if (vy >= 0 and links.contains(.{
                         .x = @intCast(x),
-                        .y = @intCast(y),
+                        .y = @intCast(vy),
                     })) {
                         break :underline if (style.flags.underline == .single)
                             .double
@@ -3603,7 +3723,10 @@ pub fn Renderer(comptime GraphicsAPI: type) type {
             self.cells.setCursor(.{
                 .atlas = .grayscale,
                 .bools = .{ .is_cursor_glyph = true },
-                .grid_pos = .{ x, cursor_vp.y },
+                .grid_pos = .{
+                    x,
+                    @intCast(cursor_vp.y + self.terminal_state.viewportStart()),
+                },
                 .color = .{ cursor_color.r, cursor_color.g, cursor_color.b, alpha },
                 .glyph_pos = .{ render.glyph.atlas_x, render.glyph.atlas_y },
                 .glyph_size = .{ render.glyph.width, render.glyph.height },

@@ -8,6 +8,7 @@ layout(location = 2) in vec4 source_rect;
 layout(location = 3) in vec2 dest_size;
 
 out vec2 tex_coord;
+out float grid_y;
 
 void main() {
     int vid = gl_VertexID;
@@ -40,8 +41,12 @@ void main() {
 
     // The position of our image starts at the top-left of the grid cell and
     // adds the source rect width/height components.
-    vec2 image_pos = (cell_size * grid_pos) + cell_offset;
+    vec2 image_pos = (cell_size * grid_pos) + cell_offset + grid_translate;
     image_pos += dest_size * corner;
 
     gl_Position = projection_matrix * vec4(image_pos.xy, 1.0, 1.0);
+
+    // The fragment shader clips contents that the grid translate moved
+    // outside of the viewport area.
+    grid_y = image_pos.y;
 }

@@ -178,6 +178,17 @@ pub const Uniforms = extern struct {
     /// top, right, bottom, left.
     grid_padding: [4]f32 align(16),
 
+    /// Translation applied to cell buffer Y coordinates, in pixels.
+    /// Buffer rows are rendered shifted by this amount; used to render
+    /// the grid at a fractional row offset for smooth scrolling. The
+    /// X component is currently always zero.
+    grid_translate: [2]f32 align(8),
+
+    /// The y range in grid-space pixels inside which grid contents are
+    /// visible. Contents outside this range — e.g. overscan rows
+    /// translated out of view — are clipped.
+    grid_clip: [2]f32 align(8),
+
     /// Bit mask defining which directions to
     /// extend cell colors in to the padding.
     /// Order, LSB first: left, right, up, down

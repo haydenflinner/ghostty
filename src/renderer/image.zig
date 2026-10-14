@@ -37,6 +37,21 @@ pub const State = struct {
     /// Overlays
     overlay_placements: std.ArrayListUnmanaged(Placement),
 
+    /// The number of overscan rows captured above the viewport. Kitty
+    /// placements are viewport-relative so this bias maps them to the
+    /// overscan-inclusive buffer row space that the shader translates.
+    overscan_above: u32 = 0,
+
+    /// The number of overscan rows captured below the viewport. This
+    /// widens the placement scan bounds so images anchored just below
+    /// the viewport continue to render while scrolled in.
+    overscan_below: u32 = 0,
+
+    /// The scroll translation in pixels that the shader applies to grid
+    /// contents for smooth scrolling. Overlay placements are rendered
+    /// outside of the grid so they compensate to remain fixed.
+    scroll_translate_px: f32 = 0,
+
     pub const empty: State = .{
         .images = .empty,
         .kitty_placements = .empty,
@@ -134,6 +149,22 @@ pub const State = struct {
                 },
             };
 
+            // Kitty placements are viewport-relative so we bias them by
+            // the overscan row count to match the buffer row space that
+            // the shader's grid translate operates on. Overlays are
+            // drawn outside the grid so they cancel the translate to
+            // remain fixed in place.
+            const grid_y = switch (placement_type) {
+                .overlay => @as(f32, @floatFromInt(p.y)),
+                else => @as(f32, @floatFromInt(p.y)) +
+                    @as(f32, @floatFromInt(self.overscan_above)),
+            };
+            const cell_offset_y = switch (placement_type) {
+                .overlay => @as(f32, @floatFromInt(p.cell_offset_y)) -
+                    self.scroll_translate_px,
+                else => @as(f32, @floatFromInt(p.cell_offset_y)),
+            };
+
             // Create our vertex buffer, which is always exactly one item.
             // future(mitchellh): we can group rendering multiple instances of a single image
             var buf = GraphicsAPI.Buffer(GraphicsAPI.shaders.Image).initFill(
@@ -141,12 +172,12 @@ pub const State = struct {
                 &.{.{
                     .grid_pos = .{
                         @as(f32, @floatFromInt(p.x)),
-                        @as(f32, @floatFromInt(p.y)),
+                        grid_y,
                     },
 
                     .cell_offset = .{
                         @as(f32, @floatFromInt(p.cell_offset_x)),
-                        @as(f32, @floatFromInt(p.cell_offset_y)),
+                        cell_offset_y,
                     },
 
                     .source_rect = .{
@@ -579,8 +610,13 @@ pub const State = struct {
         const img_left_x: i64 = @as(i64, origin.pin.x) + origin.horizontal_offset;
         const img_right_x: i64 = img_left_x + grid.cols - 1;
 
-        // If the placement isn't within our viewport then skip it.
-        if (img_top_y > bot_y or img_bot_y < top_y) return;
+        // If the placement isn't within our viewport then skip it. We
+        // widen the bounds by the overscan rows so placements anchored
+        // just outside the viewport still render while scrolled in
+        // fractionally. The viewport-relative position may be negative.
+        const scan_top_y = @as(i64, top_y) - @as(i64, self.overscan_above);
+        const scan_bot_y = @as(i64, bot_y) + @as(i64, self.overscan_below);
+        if (img_top_y > scan_bot_y or img_bot_y < scan_top_y) return;
         if (img_left_x >= t.cols or img_right_x < 0) return;
 
         // Viewport-relative position. Offsets so extreme that the
