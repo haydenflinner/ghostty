@@ -249,6 +249,12 @@ const Mouse = struct {
     pending_scroll_x: f64 = 0,
     pending_scroll_y: f64 = 0,
 
+    /// The fractional vertical scroll offset in pixels applied to the
+    /// rendered grid (`pending_scroll_y` clamped to what can display).
+    /// Mirrored to `renderer_state.scroll_offset_px` under its mutex;
+    /// this copy is read on the GUI thread for posToViewport.
+    scroll_offset_px: f64 = 0,
+
     /// True if the mouse is hidden
     hidden: bool = false,
 
@@ -1255,6 +1261,8 @@ fn selectionScrollTick(self: *Surface) !void {
             .screen_height = self.size.screen.height,
         },
     });
+
+    self.resetScrollOffset();
 
     // If we're no longer autoscrolling for whatever reason, disable it.
     if (self.mouse.selection_gesture.left_drag_autoscroll == .none) {
@@ -2953,7 +2961,10 @@ pub fn keyCallback(
             try self.setSelection(null);
         }
 
-        if (self.config.scroll_to_bottom.keystroke) self.io.terminal.scrollViewport(.bottom);
+        if (self.config.scroll_to_bottom.keystroke) {
+            self.io.terminal.scrollViewport(.bottom);
+            self.resetScrollOffset();
+        }
 
         try self.queueRender();
     }
@@ -3734,6 +3745,36 @@ pub fn scrollCallback(
             // rendering. We have to switch signs here because our delta
             // is negative down but our viewport is positive down.
             self.io.terminal.scrollViewport(.{ .delta = y.delta * -1 });
+        }
+
+        // Publish the pending scroll amount as our fractional scroll
+        // offset. It only reveals a partial row if one exists beyond
+        // the viewport in that direction; otherwise drop the remainder
+        // so subsequent scrolls take effect immediately.
+        {
+            var poff = self.mouse.pending_scroll_y;
+            const pages = &self.io.terminal.screens.active.pages;
+            if (poff > 0) {
+                const tl = pages.getTopLeft(.viewport);
+                switch (tl.upOverflow(1)) {
+                    .offset => {},
+                    .overflow => poff = 0,
+                }
+            } else if (poff < 0) {
+                if (pages.getBottomRight(.viewport)) |br| {
+                    switch (br.downOverflow(1)) {
+                        .offset => {},
+                        .overflow => poff = 0,
+                    }
+                } else poff = 0;
+            }
+
+            // The pending amount can go stale if the cell size changes.
+            const cell_size: f64 = @floatFromInt(self.size.cell.height);
+            poff = std.math.clamp(poff, 1 - cell_size, cell_size - 1);
+            self.mouse.pending_scroll_y = poff;
+            self.mouse.scroll_offset_px = poff;
+            self.renderer_state.scroll_offset_px = @floatCast(poff);
         }
     }
 
@@ -4870,8 +4911,12 @@ pub fn colorSchemeCallback(self: *Surface, scheme: apprt.ColorScheme) !void {
 }
 
 pub fn posToViewport(self: Surface, xpos: f64, ypos: f64) terminal.point.Coordinate {
-    // Get our grid cell
-    const coord: rendererpkg.Coordinate = .{ .surface = .{ .x = xpos, .y = ypos } };
+    // Get our grid cell; subtract the fractional scroll offset to
+    // match the rendered grid.
+    const coord: rendererpkg.Coordinate = .{ .surface = .{
+        .x = xpos,
+        .y = ypos - self.mouse.scroll_offset_px,
+    } };
     const grid = coord.convert(.grid, self.size).grid;
     return .{ .x = grid.x, .y = grid.y };
 }
@@ -4881,7 +4926,18 @@ pub fn posToViewport(self: Surface, xpos: f64, ypos: f64) terminal.point.Coordin
 /// Precondition: the render_state mutex must be held.
 fn scrollToBottom(self: *Surface) !void {
     self.io.terminal.scrollViewport(.{ .bottom = {} });
+    self.resetScrollOffset();
     try self.queueRender();
+}
+
+/// Reset the fractional scroll offset and pending scroll remainder.
+/// Call when the viewport moves outside of scroll events.
+///
+/// Precondition: the render_state mutex must be held.
+fn resetScrollOffset(self: *Surface) void {
+    self.mouse.pending_scroll_y = 0;
+    self.mouse.scroll_offset_px = 0;
+    self.renderer_state.scroll_offset_px = 0;
 }
 
 fn hideMouse(self: *Surface) void {
@@ -5343,12 +5399,16 @@ pub fn performBindingAction(self: *Surface, action: input.Binding.Action) !bool 
         },
 
         .scroll_to_top => {
+            self.mouse.pending_scroll_y = 0;
+            self.mouse.scroll_offset_px = 0;
             self.queueIo(.{
                 .scroll_viewport = .{ .top = {} },
             }, .unlocked);
         },
 
         .scroll_to_bottom => {
+            self.mouse.pending_scroll_y = 0;
+            self.mouse.scroll_offset_px = 0;
             self.queueIo(.{
                 .scroll_viewport = .{ .bottom = {} },
             }, .unlocked);
@@ -5360,6 +5420,7 @@ pub fn performBindingAction(self: *Surface, action: input.Binding.Action) !bool 
                 defer self.renderer_state.mutex.unlock(global.io());
                 const t: *terminal.Terminal = self.renderer_state.terminal;
                 t.screens.active.scroll(.{ .row = n });
+                self.resetScrollOffset();
             }
 
             try self.queueRender();
@@ -5372,6 +5433,7 @@ pub fn performBindingAction(self: *Surface, action: input.Binding.Action) !bool 
                 const sel = self.io.terminal.screens.active.selection orelse return false;
                 const tl = sel.topLeft(self.io.terminal.screens.active);
                 self.io.terminal.screens.active.scroll(.{ .pin = tl });
+                self.resetScrollOffset();
             }
 
             try self.queueRender();
@@ -5379,6 +5441,8 @@ pub fn performBindingAction(self: *Surface, action: input.Binding.Action) !bool 
 
         .scroll_page_up => {
             const rows: isize = @intCast(self.size.grid().rows);
+            self.mouse.pending_scroll_y = 0;
+            self.mouse.scroll_offset_px = 0;
             self.queueIo(.{
                 .scroll_viewport = .{ .delta = -1 * rows },
             }, .unlocked);
@@ -5386,6 +5450,8 @@ pub fn performBindingAction(self: *Surface, action: input.Binding.Action) !bool 
 
         .scroll_page_down => {
             const rows: isize = @intCast(self.size.grid().rows);
+            self.mouse.pending_scroll_y = 0;
+            self.mouse.scroll_offset_px = 0;
             self.queueIo(.{
                 .scroll_viewport = .{ .delta = rows },
             }, .unlocked);
@@ -5394,18 +5460,24 @@ pub fn performBindingAction(self: *Surface, action: input.Binding.Action) !bool 
         .scroll_page_fractional => |fraction| {
             const rows: f32 = @floatFromInt(self.size.grid().rows);
             const delta: isize = @intFromFloat(@trunc(fraction * rows));
+            self.mouse.pending_scroll_y = 0;
+            self.mouse.scroll_offset_px = 0;
             self.queueIo(.{
                 .scroll_viewport = .{ .delta = delta },
             }, .unlocked);
         },
 
         .scroll_page_lines => |lines| {
+            self.mouse.pending_scroll_y = 0;
+            self.mouse.scroll_offset_px = 0;
             self.queueIo(.{
                 .scroll_viewport = .{ .delta = lines },
             }, .unlocked);
         },
 
         .jump_to_prompt => |delta| {
+            self.mouse.pending_scroll_y = 0;
+            self.mouse.scroll_offset_px = 0;
             self.queueIo(.{
                 .jump_to_prompt = @intCast(delta),
             }, .unlocked);

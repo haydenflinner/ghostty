@@ -33,6 +33,13 @@ preedit: ?Preedit = null,
 /// need about the mouse.
 mouse: Mouse = .{},
 
+/// The fractional scroll offset of the viewport in pixels, i.e. the
+/// sub-row remainder of scroll input in the range [0, cell height).
+/// The grid renders shifted down by this amount, revealing a fraction
+/// of the row above the viewport. Managed by the surface; viewport
+/// moves outside of scroll events must reset this to zero.
+scroll_offset_px: f32 = 0,
+
 /// The number of threads currently waiting to acquire `mutex` via
 /// `lockDemand`. This is not protected by the mutex; it is read by
 /// hot lock/unlock loops (the IO parse thread) in `yieldToDemand` to
