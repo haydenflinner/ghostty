@@ -655,6 +655,7 @@ pub fn scrollViewport(
     self.renderer_state.mutex.lockUncancelable(global.io());
     defer self.renderer_state.mutex.unlock(global.io());
     self.terminal.scrollViewport(scroll);
+    self.renderer_state.scroll_offset_px = 0;
 }
 
 /// Jump the viewport to the prompt.
@@ -663,6 +664,7 @@ pub fn jumpToPrompt(self: *Termio, delta: isize) !void {
         self.renderer_state.mutex.lockUncancelable(global.io());
         defer self.renderer_state.mutex.unlock(global.io());
         self.terminal.screens.active.scroll(.{ .delta_prompt = delta });
+        self.renderer_state.scroll_offset_px = 0;
     }
 
     try self.renderer_wakeup.notify();

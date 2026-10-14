@@ -33,6 +33,22 @@ preedit: ?Preedit = null,
 /// need about the mouse.
 mouse: Mouse = .{},
 
+/// The fractional scroll offset of the viewport in pixels.
+///
+/// When this is non-zero the terminal grid is rendered shifted down by
+/// this amount, revealing the corresponding fraction of the row above
+/// the viewport. This is always in the range [0, cell height): scrolling
+/// that crosses a full row moves the viewport itself, and this value is
+/// the leftover sub-row remainder. It is only meaningful when a row
+/// exists above the viewport to reveal; renderers should treat it as
+/// zero when no such row exists.
+///
+/// This is managed by the surface scroll handling. Any viewport
+/// movement that doesn't come from scroll events (scrollbar drags,
+/// scroll bindings, scroll-to-bottom on output, etc.) should reset
+/// this to zero.
+scroll_offset_px: f32 = 0,
+
 /// The number of threads currently waiting to acquire `mutex` via
 /// `lockDemand`. This is not protected by the mutex; it is read by
 /// hot lock/unlock loops (the IO parse thread) in `yieldToDemand` to
